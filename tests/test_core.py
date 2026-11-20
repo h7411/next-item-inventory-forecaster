@@ -143,9 +143,39 @@ def test_milestone_3():
 
 
 # Milestone 4: Build a Streamlit UI to input a partial basket and display predictions.
-@pytest.mark.skip(reason="remove this line when you start milestone 4")
 def test_milestone_4():
-    raise NotImplementedError("write the test for milestone 4")
+    import py_compile
+    from app.core import (
+        DEFAULT_CATALOG,
+        PRESET_BASKETS,
+        calculate_restock_recommendation,
+        get_catalog_names,
+        get_sku_details,
+        milestone_4,
+    )
+
+    # Test py_compile of app/main.py
+    py_compile.compile("app/main.py", doraise=True)
+
+    # Test UI helper functions
+    names = get_catalog_names(DEFAULT_CATALOG)
+    assert len(names) == len(DEFAULT_CATALOG)
+    assert "Whole Milk 1L" in names
+
+    sku_obj = get_sku_details("Whole Milk 1L")
+    assert sku_obj is not None
+    assert sku_obj.category == "Dairy"
+
+    assert len(PRESET_BASKETS) >= 4
+    assert "Breakfast Essentials" in PRESET_BASKETS
+
+    # Test milestone 4 workflow execution
+    res = milestone_4()
+    assert res["status"] == "completed"
+    assert res["catalog_item_count"] >= 20
+    assert res["preset_count"] >= 4
+    assert res["predictions_generated"] > 0
+    assert res["restock_table_rows"] > 0
 
 
 # Milestone 5: Evaluate model performance against a simple baseline.

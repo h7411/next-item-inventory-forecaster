@@ -839,12 +839,121 @@ def milestone_3(checkpoint_path: str = "data/forecaster_lm.pt") -> dict[str, Any
 
 
 # ============================================================================
-# Stubs for Milestones 4-5 (Implemented in subsequent steps)
+# Milestone 4: Streamlit UI Helpers & Workflow Interface
 # ============================================================================
 
-def milestone_4():  # TODO(milestone 4)
-    raise NotImplementedError("TODO(milestone 4)")
+PRESET_BASKETS = {
+    "Breakfast Essentials": ["Whole Milk 1L", "Corn Flakes Cereal 500g"],
+    "Italian Pasta Dinner": ["Penne Rigate Pasta 500g", "Classic Marinara Sauce 400g"],
+    "Morning Coffee Break": ["Dark Roast Coffee Beans 250g", "Oat Milk Barista 1L"],
+    "Snack & Dip Party": ["Sea Salt Tortilla Chips 200g", "Chunky Tomato Salsa 300g"],
+    "Gourmet Sandwich": ["Sourdough Bread 500g", "Cheddar Cheese 200g", "Salted Butter 250g"],
+}
 
+
+def get_catalog_names(catalog: Optional[List[SKUItem]] = None) -> List[str]:
+    """Return all catalog item names in alphabetical order."""
+    cat = catalog or DEFAULT_CATALOG
+    return sorted(item.name for item in cat)
+
+
+def get_sku_details(name: str, catalog: Optional[List[SKUItem]] = None) -> Optional[SKUItem]:
+    """Retrieve SKUItem dataclass object by product name."""
+    cat = catalog or DEFAULT_CATALOG
+    for item in cat:
+        if item.name == name:
+            return item
+    return None
+
+
+def calculate_restock_recommendation(
+    predictions: List[NextItemPrediction],
+    safety_margin_pct: float = 0.15,
+) -> List[Dict[str, Any]]:
+    """Compute actionable store inventory restock recommendations for store managers."""
+    reorder_table = []
+    lead_times = {
+        "Dairy": "1-2 days (Perishable)",
+        "Bakery": "1 day (Daily Fresh)",
+        "Produce": "1-2 days (Daily Fresh)",
+        "Pantry": "3-5 days (Ambient)",
+        "Beverages": "2-4 days (Ambient)",
+        "Snacks": "2-4 days (Ambient)",
+    }
+
+    base_case_packs = {
+        "HIGH": 30,
+        "MEDIUM": 18,
+        "LOW": 8,
+    }
+
+    for pred in predictions:
+        base_packs = base_case_packs.get(pred.reorder_urgency, 10)
+        recommended_qty = int(math.ceil(base_packs * (1.0 + safety_margin_pct)))
+        reorder_table.append({
+            "SKU": pred.sku_id,
+            "Product": pred.name,
+            "Category": pred.category,
+            "Confidence": pred.confidence_pct,
+            "Urgency": pred.reorder_urgency,
+            "Recommended Restock Units": recommended_qty,
+            "Lead Time": lead_times.get(pred.category, "3 days"),
+            "Unit Price": f"${pred.base_price:.2f}",
+        })
+    return reorder_table
+
+
+def get_cached_model_and_tokenizer(checkpoint_path: str = "data/forecaster_lm.pt") -> Tuple[SmallCausalSKUModel, Tokenizer]:
+    """Load or initialize the pre-trained SKU Forecaster model and tokenizer."""
+    catalog = DEFAULT_CATALOG
+    tokenizer = Tokenizer(catalog)
+    model = SmallCausalSKUModel(
+        vocab_size=tokenizer.vocab_size,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=128,
+        max_seq_len=24,
+    )
+    path = Path(checkpoint_path)
+    if path.exists():
+        load_model_checkpoint(model, path)
+    else:
+        milestone_2(epochs=3)
+        load_model_checkpoint(model, path)
+    model.eval()
+    return model, tokenizer
+
+
+def milestone_4() -> dict[str, Any]:
+    """Milestone 4: Build a Streamlit UI to input a partial basket and display predictions."""
+    catalog = DEFAULT_CATALOG
+    names = get_catalog_names(catalog)
+    presets = PRESET_BASKETS
+
+    model, tokenizer = get_cached_model_and_tokenizer()
+
+    # Verify prediction pipeline for UI
+    test_basket = presets["Breakfast Essentials"]
+    predictions = predict_next_items(model, tokenizer, test_basket, top_k=5)
+    bundle = suggest_complementary_bundle(predictions, basket=test_basket)
+    restock_table = calculate_restock_recommendation(predictions, safety_margin_pct=0.20)
+
+    return {
+        "status": "completed",
+        "catalog_item_count": len(names),
+        "preset_count": len(presets),
+        "sample_preset_tested": "Breakfast Essentials",
+        "predictions_generated": len(predictions),
+        "bundle_generated": bundle.bundle_name,
+        "restock_table_rows": len(restock_table),
+        "ui_entry_point": "app/main.py",
+    }
+
+
+# ============================================================================
+# Stubs for Milestone 5 (Implemented in subsequent step)
+# ============================================================================
 
 def milestone_5():  # TODO(milestone 5)
     raise NotImplementedError("TODO(milestone 5)")
