@@ -952,8 +952,197 @@ def milestone_4() -> dict[str, Any]:
 
 
 # ============================================================================
-# Stubs for Milestone 5 (Implemented in subsequent step)
+# Milestone 5: Evaluate Model Performance Against a Simple Baseline
 # ============================================================================
 
-def milestone_5():  # TODO(milestone 5)
-    raise NotImplementedError("TODO(milestone 5)")
+class PopularityBaseline:
+    """Heuristic baseline that ranks candidates by overall dataset popularity, ignoring basket context."""
+
+    def __init__(self, train_baskets: List[List[str]], catalog: List[SKUItem]):
+        self.catalog = catalog
+        self.item_counts: Dict[str, int] = {item.name: 1 for item in catalog}  # Laplace smoothing
+        for basket in train_baskets:
+            for item in basket:
+                if item in self.item_counts:
+                    self.item_counts[item] += 1
+        self.total = sum(self.item_counts.values())
+
+    def score_candidates(self, visible_basket: Sequence[str], candidate_names: Sequence[str]) -> Dict[str, float]:
+        """Return popularity probabilities for candidates."""
+        visible_set = set(visible_basket)
+        scores = {}
+        for name in candidate_names:
+            if name in visible_set:
+                scores[name] = -float("inf")
+            else:
+                scores[name] = self.item_counts.get(name, 1) / self.total
+        return scores
+
+
+class ItemToItemBaseline:
+    """Counting co-occurrence baseline: scores items by pairwise joint appearance with visible basket items."""
+
+    def __init__(self, train_baskets: List[List[str]], catalog: List[SKUItem]):
+        self.catalog = catalog
+        self.names = [item.name for item in catalog]
+        self.pos = {name: i for i, name in enumerate(self.names)}
+        n = len(self.names)
+        self.co_matrix = np.zeros((n, n), dtype=np.float64)
+        for basket in train_baskets:
+            indices = [self.pos[x] for x in basket if x in self.pos]
+            for i in indices:
+                for j in indices:
+                    self.co_matrix[i, j] += 1
+        self.alone = np.diag(self.co_matrix).copy()
+
+    def score_candidates(self, visible_basket: Sequence[str], candidate_names: Sequence[str]) -> Dict[str, float]:
+        visible_set = set(visible_basket)
+        held = [self.pos[x] for x in visible_basket if x in self.pos]
+        scores = {}
+        if not held:
+            for name in candidate_names:
+                scores[name] = 0.0 if name not in visible_set else -float("inf")
+            return scores
+
+        # Average conditional confidence P(c | v)
+        sub = self.co_matrix[held, :] / np.maximum(self.alone[held, None], 1.0)
+        conf = np.mean(sub, axis=0)
+        for idx, name in enumerate(self.names):
+            if name in visible_set:
+                scores[name] = -float("inf")
+            else:
+                scores[name] = float(conf[idx])
+        return scores
+
+
+def make_eval_cases(test_baskets: List[List[str]], n_cases: int = 150, seed: int = 42) -> List[Dict[str, Any]]:
+    """Create leave-one-out evaluation cases by hiding one random item from each test basket."""
+    rng = random.Random(seed)
+    eligible = [b for b in test_baskets if len(b) >= 2]
+    sampled = rng.sample(eligible, min(n_cases, len(eligible))) if len(eligible) > n_cases else eligible
+
+    cases = []
+    for b in sampled:
+        shuffled = list(b)
+        rng.shuffle(shuffled)
+        hidden = shuffled[0]
+        visible = shuffled[1:]
+        cases.append({"visible": visible, "target": hidden})
+    return cases
+
+
+def evaluate_ranking(ranks: Sequence[int]) -> Dict[str, float]:
+    """Compute standard ranking evaluation metrics: MRR, Hits@1, Hits@3, Hits@5, Median Rank."""
+    if not ranks:
+        return {"mrr": 0.0, "hits@1": 0.0, "hits@3": 0.0, "hits@5": 0.0, "median_rank": 0.0}
+    r = np.array(ranks, dtype=float)
+    return {
+        "mrr": round(float(np.mean(1.0 / r)), 4),
+        "hits@1": round(float(np.mean(r <= 1)), 4),
+        "hits@3": round(float(np.mean(r <= 3)), 4),
+        "hits@5": round(float(np.mean(r <= 5)), 4),
+        "median_rank": round(float(np.median(r)), 1),
+    }
+
+
+def evaluate_model_on_cases(
+    model: SmallCausalSKUModel,
+    tokenizer: Tokenizer,
+    cases: List[Dict[str, Any]],
+) -> Dict[str, float]:
+    """Evaluate trained causal LM on leave-one-out next-item prediction cases."""
+    ranks = []
+    all_catalog_names = [item.name for item in tokenizer.catalog]
+
+    for case in cases:
+        visible = case["visible"]
+        target = case["target"]
+
+        preds = predict_next_items(
+            model=model,
+            tokenizer=tokenizer,
+            basket=visible,
+            top_k=len(all_catalog_names),
+            exclude_current=True,
+        )
+        ranked_names = [p.name for p in preds]
+
+        if target in ranked_names:
+            rank = ranked_names.index(target) + 1
+        else:
+            rank = len(all_catalog_names)
+        ranks.append(rank)
+
+    return evaluate_ranking(ranks)
+
+
+def evaluate_baseline_on_cases(
+    baseline: PopularityBaseline | ItemToItemBaseline,
+    cases: List[Dict[str, Any]],
+    catalog: List[SKUItem],
+) -> Dict[str, float]:
+    """Evaluate heuristic baseline on leave-one-out next-item prediction cases."""
+    ranks = []
+    catalog_names = [item.name for item in catalog]
+
+    for case in cases:
+        visible = case["visible"]
+        target = case["target"]
+        scores = baseline.score_candidates(visible, catalog_names)
+
+        # Sort candidate names descending by score
+        sorted_candidates = sorted(
+            [name for name in catalog_names if name not in set(visible)],
+            key=lambda n: scores.get(n, -float("inf")),
+            reverse=True,
+        )
+
+        if target in sorted_candidates:
+            rank = sorted_candidates.index(target) + 1
+        else:
+            rank = len(catalog_names)
+        ranks.append(rank)
+
+    return evaluate_ranking(ranks)
+
+
+def milestone_5(n_cases: int = 100) -> dict[str, Any]:
+    """Milestone 5: Evaluate model performance against a simple baseline."""
+    catalog = DEFAULT_CATALOG
+    tokenizer = Tokenizer(catalog)
+    transactions = generate_mock_transactions(n_transactions=1200, catalog=catalog, seed=42)
+    train_b, _, test_b = split_dataset(transactions, seed=42)
+
+    model, _ = get_cached_model_and_tokenizer()
+
+    # Generate evaluation cases
+    eval_cases = make_eval_cases(test_b, n_cases=n_cases, seed=42)
+
+    # Baselines
+    pop_baseline = PopularityBaseline(train_b, catalog)
+    item_baseline = ItemToItemBaseline(train_b, catalog)
+
+    # Compute metrics
+    lm_metrics = evaluate_model_on_cases(model, tokenizer, eval_cases)
+    pop_metrics = evaluate_baseline_on_cases(pop_baseline, eval_cases, catalog)
+    item_metrics = evaluate_baseline_on_cases(item_baseline, eval_cases, catalog)
+
+    mrr_gain = round(lm_metrics["mrr"] - pop_metrics["mrr"], 4)
+    outperforms = lm_metrics["mrr"] > pop_metrics["mrr"]
+
+    comparison_table = [
+        {"Model": "Trained Causal LM", **lm_metrics},
+        {"Model": "Item-to-Item Baseline", **item_metrics},
+        {"Model": "Heuristic Popularity Baseline", **pop_metrics},
+    ]
+
+    return {
+        "status": "completed",
+        "evaluation_cases_evaluated": len(eval_cases),
+        "trained_model_metrics": lm_metrics,
+        "popularity_baseline_metrics": pop_metrics,
+        "item_to_item_metrics": item_metrics,
+        "mrr_improvement_over_popularity": mrr_gain,
+        "trained_model_outperforms_baseline": outperforms,
+        "comparison_table": comparison_table,
+    }

@@ -179,6 +179,47 @@ def test_milestone_4():
 
 
 # Milestone 5: Evaluate model performance against a simple baseline.
-@pytest.mark.skip(reason="remove this line when you start milestone 5")
 def test_milestone_5():
-    raise NotImplementedError("write the test for milestone 5")
+    from app.core import (
+        DEFAULT_CATALOG,
+        ItemToItemBaseline,
+        PopularityBaseline,
+        evaluate_ranking,
+        make_eval_cases,
+        milestone_5,
+    )
+
+    # Test metric calculations
+    dummy_ranks = [1, 2, 4, 1]
+    metrics = evaluate_ranking(dummy_ranks)
+    assert metrics["mrr"] == round((1.0 + 0.5 + 0.25 + 1.0) / 4.0, 4)
+    assert metrics["hits@1"] == 0.5
+    assert metrics["hits@3"] == 0.75
+
+    # Test baseline candidate scoring
+    catalog = DEFAULT_CATALOG
+    train_baskets = [["Whole Milk 1L", "Corn Flakes Cereal 500g"]] * 10
+    pop = PopularityBaseline(train_baskets, catalog)
+    scores = pop.score_candidates(["Whole Milk 1L"], [item.name for item in catalog])
+    assert scores["Whole Milk 1L"] == -float("inf")
+    assert scores["Corn Flakes Cereal 500g"] > 0
+
+    item_base = ItemToItemBaseline(train_baskets, catalog)
+    i_scores = item_base.score_candidates(["Whole Milk 1L"], [item.name for item in catalog])
+    assert i_scores["Whole Milk 1L"] == -float("inf")
+    assert i_scores["Corn Flakes Cereal 500g"] > 0
+
+    # Test eval cases generation
+    cases = make_eval_cases([["A", "B", "C"], ["D", "E"]], n_cases=5)
+    assert len(cases) == 2
+    assert "visible" in cases[0] and "target" in cases[0]
+
+    # Test full milestone 5 execution (quick 40 cases)
+    res = milestone_5(n_cases=40)
+    assert res["status"] == "completed"
+    assert res["evaluation_cases_evaluated"] > 0
+    assert "mrr" in res["trained_model_metrics"]
+    assert "mrr" in res["popularity_baseline_metrics"]
+    assert res["trained_model_outperforms_baseline"] is True
+    assert res["mrr_improvement_over_popularity"] > 0
+    assert len(res["comparison_table"]) == 3
