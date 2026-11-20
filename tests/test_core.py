@@ -1,13 +1,64 @@
-"""Your tests. Each milestone in README.md gets one here: write the test first, then make it pass.
-
-They start skipped. Remove the `skip` line as you work on each milestone.
-"""
+"""Tests for Next-Item Inventory Forecaster milestones."""
+import numpy as np
 import pytest
 
+from app.core import (
+    DEFAULT_CATALOG,
+    PLANTED_BUNDLES,
+    SKUItem,
+    Tokenizer,
+    generate_mock_transactions,
+    milestone_1,
+    parse_verbalized_basket,
+    prepare_sku_sequences,
+    split_dataset,
+    verbalize_basket,
+)
+
+
 # Milestone 1: Prepare mock sales transaction data as sequences of SKUs.
-@pytest.mark.skip(reason="remove this line when you start milestone 1")
 def test_milestone_1():
-    raise NotImplementedError("write the test for milestone 1")
+    res = milestone_1()
+    assert res["status"] == "completed"
+    assert res["catalog_size"] >= 20
+    assert res["total_transactions"] >= 1000
+    assert res["train_count"] > res["val_count"]
+    assert res["vocab_size"] > res["catalog_size"]
+    assert len(res["sample_verbalized"]) == 3
+    assert all(text.startswith("Basket: ") for text in res["sample_verbalized"])
+
+    # Test catalog and SKU properties
+    assert isinstance(DEFAULT_CATALOG[0], SKUItem)
+    assert DEFAULT_CATALOG[0].sku_id.startswith("SKU-")
+    assert DEFAULT_CATALOG[0].base_price > 0
+
+    # Test Tokenizer
+    tok = Tokenizer(DEFAULT_CATALOG)
+    encoded = tok.encode(["Whole Milk 1L", "Corn Flakes Cereal 500g"], add_special_tokens=True)
+    assert encoded[0] == tok.bos_token_id
+    assert encoded[-1] == tok.eos_token_id
+    decoded = tok.decode(encoded, skip_special=True)
+    assert decoded == ["Whole Milk 1L", "Corn Flakes Cereal 500g"]
+
+    # Test verbalize and parse
+    basket = ["Whole Milk 1L", "Organic Bananas 1kg"]
+    verb = verbalize_basket(basket, shuffle=False)
+    assert verb == "Basket: Organic Bananas 1kg; Whole Milk 1L"
+    parsed = parse_verbalized_basket(verb)
+    assert set(parsed) == set(basket)
+
+    # Test sequence preparation shapes
+    inputs, targets, texts = prepare_sku_sequences([basket], tok, max_len=8)
+    assert inputs.shape == (1, 8)
+    assert targets.shape == (1, 8)
+    assert len(texts) == 1
+
+    # Test dataset splitting
+    dummy_baskets = [["A", "B"]] * 100
+    tr, va, te = split_dataset(dummy_baskets, train_ratio=0.8, val_ratio=0.1)
+    assert len(tr) == 80
+    assert len(va) == 10
+    assert len(te) == 10
 
 
 # Milestone 2: Continue pretrain a small language model on these SKU sequences.
@@ -32,4 +83,3 @@ def test_milestone_4():
 @pytest.mark.skip(reason="remove this line when you start milestone 5")
 def test_milestone_5():
     raise NotImplementedError("write the test for milestone 5")
-
