@@ -594,12 +594,253 @@ def milestone_2(epochs: int = 6) -> dict[str, Any]:
 
 
 # ============================================================================
-# Stubs for Milestones 3-5 (Implemented in subsequent steps)
+# Milestone 3: Next-Item Prediction Logic Using the Trained Model
 # ============================================================================
 
-def milestone_3():  # TODO(milestone 3)
-    raise NotImplementedError("TODO(milestone 3)")
+@dataclass
+class NextItemPrediction:
+    sku_id: str
+    name: str
+    category: str
+    base_price: float
+    unit: str
+    confidence: float
+    confidence_pct: str
+    reorder_urgency: str
 
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
+class ComplementaryBundle:
+    bundle_name: str
+    items: List[str]
+    total_price: float
+    discounted_price: float
+    savings: float
+    expected_basket_uplift: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+def determine_reorder_urgency(confidence: float, category: str) -> str:
+    """Categorize inventory reorder urgency based on model confidence and category."""
+    fast_moving = {"Dairy", "Bakery", "Produce"}
+    if confidence >= 0.20 or (confidence >= 0.12 and category in fast_moving):
+        return "HIGH"
+    elif confidence >= 0.08:
+        return "MEDIUM"
+    return "LOW"
+
+
+def predict_next_items(
+    model: SmallCausalSKUModel,
+    tokenizer: Tokenizer,
+    basket: Sequence[str] | str,
+    top_k: int = 5,
+    exclude_current: bool = True,
+    quantities: Optional[Dict[str, int]] = None,
+    temperature: float = 1.0,
+) -> List[NextItemPrediction]:
+    """Predict the most likely next items given a partial shopping basket.
+    
+    Supports:
+    - Partial basket as list of names or verbalized string.
+    - Filtering out already selected items.
+    - Confidence scores & calibrated probabilities (Stretch Idea 2).
+    - Incorporating item quantities (Stretch Idea 1).
+    """
+    model.eval()
+
+    # Parse input basket if provided as string
+    if isinstance(basket, str):
+        items = parse_verbalized_basket(basket) if basket.startswith(PREFIX) else [
+            x.strip() for x in basket.split(",") if x.strip()
+        ]
+    else:
+        items = list(basket)
+
+    # Filter to known items
+    valid_items = [name for name in items if name in tokenizer.name_to_sku]
+
+    # If basket is completely empty, use BOS token alone
+    if not valid_items:
+        prefix_tokens = [tokenizer.bos_token_id]
+    else:
+        prefix_tokens = [tokenizer.bos_token_id] + [tokenizer.token_to_id[name] for name in valid_items]
+
+    # Truncate to max sequence length if needed
+    prefix_tokens = prefix_tokens[-model.max_seq_len :]
+
+    with torch.no_grad():
+        input_tensor = torch.tensor([prefix_tokens], dtype=torch.long)
+        logits = model(input_tensor)
+        # Logits at the final position
+        last_logits = logits[0, -1, :].clone()
+
+        # Mask out special tokens
+        special_ids = [
+            tokenizer.pad_token_id,
+            tokenizer.bos_token_id,
+            tokenizer.eos_token_id,
+            tokenizer.sep_token_id,
+            tokenizer.unk_token_id,
+        ]
+        for sid in special_ids:
+            last_logits[sid] = -float("inf")
+
+        # Exclude items already in the basket (cross-sell constraint)
+        if exclude_current:
+            for name in valid_items:
+                token_id = tokenizer.token_to_id.get(name)
+                if token_id is not None:
+                    last_logits[token_id] = -float("inf")
+
+        # Stretch Idea 1: incorporate quantities (boost probability of complementary items)
+        if quantities:
+            for item_name, qty in quantities.items():
+                if qty > 1 and item_name in tokenizer.name_to_sku:
+                    item_cat = tokenizer.name_to_sku[item_name].category
+                    # boost items in complementary categories
+                    for cat_item in tokenizer.catalog:
+                        if cat_item.category == item_cat and cat_item.name != item_name:
+                            tid = tokenizer.token_to_id[cat_item.name]
+                            if last_logits[tid] != -float("inf"):
+                                last_logits[tid] += 0.15 * math.log(qty)
+
+        # Scale by temperature and apply softmax
+        scaled_logits = last_logits / max(1e-4, temperature)
+        probs = F.softmax(scaled_logits, dim=-1).cpu().numpy()
+
+    # Extract catalog item probabilities
+    item_scores: List[Tuple[str, float]] = []
+    for item in tokenizer.catalog:
+        tid = tokenizer.token_to_id[item.name]
+        score = float(probs[tid])
+        item_scores.append((item.name, score))
+
+    # Sort descending
+    item_scores.sort(key=lambda x: x[1], reverse=True)
+
+    predictions: List[NextItemPrediction] = []
+    for name, confidence in item_scores[:top_k]:
+        sku_obj = tokenizer.name_to_sku[name]
+        urgency = determine_reorder_urgency(confidence, sku_obj.category)
+        predictions.append(
+            NextItemPrediction(
+                sku_id=sku_obj.sku_id,
+                name=sku_obj.name,
+                category=sku_obj.category,
+                base_price=sku_obj.base_price,
+                unit=sku_obj.unit,
+                confidence=round(confidence, 4),
+                confidence_pct=f"{confidence * 100:.1f}%",
+                reorder_urgency=urgency,
+            )
+        )
+
+    return predictions
+
+
+def suggest_complementary_bundle(
+    predictions: List[NextItemPrediction],
+    basket: Optional[Sequence[str]] = None,
+    discount_pct: float = 0.10,
+) -> ComplementaryBundle:
+    """Suggest an optimized complementary retail bundle from top predictions (Stretch Idea 3)."""
+    if not predictions:
+        return ComplementaryBundle(
+            bundle_name="Store Favourites",
+            items=[],
+            total_price=0.0,
+            discounted_price=0.0,
+            savings=0.0,
+            expected_basket_uplift="0%",
+        )
+
+    # Pick top 2 or 3 predicted items for the bundle
+    bundle_items = predictions[:3]
+    item_names = [p.name for p in bundle_items]
+    raw_total = sum(p.base_price for p in bundle_items)
+    discounted = raw_total * (1.0 - discount_pct)
+    savings = raw_total - discounted
+
+    # Determine theme name based on dominant category
+    categories = [p.category for p in bundle_items]
+    if "Dairy" in categories and "Bakery" in categories:
+        theme = "Fresh Morning Essentials"
+    elif "Pantry" in categories:
+        theme = "Chef's Pantry Bundle"
+    elif "Snacks" in categories or "Beverages" in categories:
+        theme = "Party & Snack Combo"
+    else:
+        theme = "Smart Restock Bundle"
+
+    return ComplementaryBundle(
+        bundle_name=theme,
+        items=item_names,
+        total_price=round(raw_total, 2),
+        discounted_price=round(discounted, 2),
+        savings=round(savings, 2),
+        expected_basket_uplift=f"+{round(discount_pct * 150, 0):.0f}%",
+    )
+
+
+def milestone_3(checkpoint_path: str = "data/forecaster_lm.pt") -> dict[str, Any]:
+    """Milestone 3: Implement next-item prediction logic using the trained model."""
+    catalog = DEFAULT_CATALOG
+    tokenizer = Tokenizer(catalog)
+
+    model = SmallCausalSKUModel(
+        vocab_size=tokenizer.vocab_size,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=128,
+        max_seq_len=24,
+    )
+
+    path = Path(checkpoint_path)
+    if path.exists():
+        load_model_checkpoint(model, path)
+    else:
+        # Fallback to train briefly if checkpoint doesn't exist
+        m2_res = milestone_2(epochs=3)
+        load_model_checkpoint(model, path)
+
+    test_baskets = [
+        ["Whole Milk 1L", "Corn Flakes Cereal 500g"],
+        ["Penne Rigate Pasta 500g", "Classic Marinara Sauce 400g"],
+        ["Dark Roast Coffee Beans 250g"],
+    ]
+
+    forecast_results = {}
+    for b in test_baskets:
+        preds = predict_next_items(model, tokenizer, b, top_k=4)
+        bundle = suggest_complementary_bundle(preds, basket=b)
+        forecast_results[verbalize_basket(b, shuffle=False)] = {
+            "partial_basket": b,
+            "top_predictions": [p.to_dict() for p in preds],
+            "bundle_suggestion": bundle.to_dict(),
+        }
+
+    # Test with quantities (Stretch Idea 1)
+    preds_with_qty = predict_next_items(
+        model, tokenizer, ["Whole Milk 1L"], top_k=3, quantities={"Whole Milk 1L": 4}
+    )
+
+    return {
+        "status": "completed",
+        "sample_forecasts": forecast_results,
+        "quantity_test_predictions": [p.to_dict() for p in preds_with_qty],
+    }
+
+
+# ============================================================================
+# Stubs for Milestones 4-5 (Implemented in subsequent steps)
+# ============================================================================
 
 def milestone_4():  # TODO(milestone 4)
     raise NotImplementedError("TODO(milestone 4)")
