@@ -309,12 +309,293 @@ def milestone_1() -> dict[str, Any]:
 
 
 # ============================================================================
-# Stubs for Milestones 2-5 (Implemented in subsequent steps)
+# Milestone 2: Continue Pretrain a Small Language Model on SKU Sequences
 # ============================================================================
 
-def milestone_2():  # TODO(milestone 2)
-    raise NotImplementedError("TODO(milestone 2)")
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+
+class SmallCausalSKUModel(nn.Module):
+    """Small Causal Transformer Language Model for retail SKU sequence prediction."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 64,
+        n_heads: int = 4,
+        n_layers: int = 2,
+        dim_feedforward: int = 128,
+        max_seq_len: int = 32,
+        dropout: float = 0.1,
+        pad_idx: int = 0,
+    ):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.max_seq_len = max_seq_len
+        self.pad_idx = pad_idx
+
+        self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_idx)
+        self.pos_embedding = nn.Embedding(max_seq_len, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
+        self.layer_norm = nn.LayerNorm(d_model)
+        self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
+
+        # Weight tying between token embeddings and projection head
+        self.lm_head.weight = self.token_embedding.weight
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Forward pass through causal sequence model.
+        
+        Args:
+            input_ids: Tensor of shape (batch_size, seq_len)
+        Returns:
+            logits: Tensor of shape (batch_size, seq_len, vocab_size)
+        """
+        batch_size, seq_len = input_ids.shape
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
+
+        device = input_ids.device
+        positions = torch.arange(0, seq_len, dtype=torch.long, device=device).unsqueeze(0)
+
+        # Embeddings + Positional encoding
+        x = self.token_embedding(input_ids) * math.sqrt(self.d_model) + self.pos_embedding(positions)
+        x = self.dropout(x)
+
+        # Causal mask: position t can only attend to <= t
+        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, dtype=torch.bool).to(device)
+        padding_mask = (input_ids == self.pad_idx)
+
+        # Pass through causal transformer
+        hidden = self.transformer(x, mask=causal_mask, src_key_padding_mask=padding_mask, is_causal=True)
+        hidden = self.layer_norm(hidden)
+
+        logits = self.lm_head(hidden)
+        return logits
+
+    def compute_loss(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """Causal next-token prediction loss ignoring pad tokens."""
+        # Shift logits and targets so token t predicts t+1
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_targets = targets[:, 1:].contiguous()
+        loss = F.cross_entropy(
+            shift_logits.view(-1, self.vocab_size),
+            shift_targets.view(-1),
+            ignore_index=self.pad_idx,
+        )
+        return loss
+
+
+def train_epoch(
+    model: SmallCausalSKUModel,
+    optimizer: torch.optim.Optimizer,
+    baskets: List[List[str]],
+    tokenizer: Tokenizer,
+    batch_size: int = 32,
+    max_len: int = 16,
+    rng_seed: int = 0,
+) -> float:
+    """Train for one epoch with newly permuted basket item orders."""
+    model.train()
+    rng = random.Random(rng_seed)
+
+    # Permute order of items in each basket (lesson 3 verbalization principle)
+    permuted_sequences = []
+    for b in baskets:
+        shuffled = list(b)
+        rng.shuffle(shuffled)
+        permuted_sequences.append(shuffled)
+
+    # Shuffle dataset order
+    rng.shuffle(permuted_sequences)
+
+    total_loss = 0.0
+    num_batches = 0
+
+    for i in range(0, len(permuted_sequences), batch_size):
+        batch_baskets = permuted_sequences[i : i + batch_size]
+        inputs, targets, _ = prepare_sku_sequences(batch_baskets, tokenizer, max_len=max_len, seed=rng_seed + i)
+
+        input_tensor = torch.tensor(inputs, dtype=torch.long)
+        target_tensor = torch.tensor(targets, dtype=torch.long)
+
+        optimizer.zero_grad()
+        logits = model(input_tensor)
+        loss = model.compute_loss(logits, target_tensor)
+        loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        total_loss += loss.item()
+        num_batches += 1
+
+    return total_loss / max(1, num_batches)
+
+
+def evaluate_loss(
+    model: SmallCausalSKUModel,
+    baskets: List[List[str]],
+    tokenizer: Tokenizer,
+    batch_size: int = 32,
+    max_len: int = 16,
+) -> float:
+    """Evaluate cross-entropy validation loss on held-out baskets."""
+    model.eval()
+    total_loss = 0.0
+    num_batches = 0
+
+    with torch.no_grad():
+        for i in range(0, len(baskets), batch_size):
+            batch_baskets = baskets[i : i + batch_size]
+            inputs, targets, _ = prepare_sku_sequences(batch_baskets, tokenizer, max_len=max_len, seed=i)
+            input_tensor = torch.tensor(inputs, dtype=torch.long)
+            target_tensor = torch.tensor(targets, dtype=torch.long)
+
+            logits = model(input_tensor)
+            loss = model.compute_loss(logits, target_tensor)
+            total_loss += loss.item()
+            num_batches += 1
+
+    return total_loss / max(1, num_batches)
+
+
+def pretrain_small_lm(
+    model: SmallCausalSKUModel,
+    tokenizer: Tokenizer,
+    train_baskets: List[List[str]],
+    val_baskets: Optional[List[List[str]]] = None,
+    epochs: int = 6,
+    batch_size: int = 32,
+    lr: float = 1e-3,
+    max_len: int = 16,
+    seed: int = 42,
+) -> List[Dict[str, Any]]:
+    """Continued pretraining loop adapting the small causal LM to retail SKU sequences."""
+    torch.manual_seed(seed)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+
+    history = []
+    for epoch in range(1, epochs + 1):
+        # Linear warmup then cosine decay
+        if epoch <= 2:
+            current_lr = lr * (epoch / 2.0)
+        else:
+            progress = (epoch - 2) / max(1, epochs - 2)
+            current_lr = lr * (0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = current_lr
+
+        train_loss = train_epoch(
+            model, optimizer, train_baskets, tokenizer,
+            batch_size=batch_size, max_len=max_len, rng_seed=seed + epoch,
+        )
+
+        val_loss = (
+            evaluate_loss(model, val_baskets, tokenizer, batch_size=batch_size, max_len=max_len)
+            if val_baskets is not None
+            else None
+        )
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": round(train_loss, 4),
+            "val_loss": round(val_loss, 4) if val_loss is not None else None,
+            "lr": round(current_lr, 6),
+        })
+
+    return history
+
+
+def save_model_checkpoint(model: SmallCausalSKUModel, path: str | Path) -> None:
+    """Save model state dictionary to disk."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), str(path))
+
+
+def load_model_checkpoint(model: SmallCausalSKUModel, path: str | Path) -> SmallCausalSKUModel:
+    """Load model weights from disk."""
+    path = Path(path)
+    model.load_state_dict(torch.load(str(path), map_location="cpu", weights_only=True))
+    model.eval()
+    return model
+
+
+def milestone_2(epochs: int = 6) -> dict[str, Any]:
+    """Milestone 2: Continue pretrain a small language model on these SKU sequences."""
+    catalog = DEFAULT_CATALOG
+    tokenizer = Tokenizer(catalog)
+    transactions = generate_mock_transactions(n_transactions=1200, catalog=catalog, seed=42)
+    train_b, val_b, _ = split_dataset(transactions, seed=42)
+
+    model = SmallCausalSKUModel(
+        vocab_size=tokenizer.vocab_size,
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        dim_feedforward=128,
+        max_seq_len=24,
+        dropout=0.05,
+    )
+
+    history = pretrain_small_lm(
+        model=model,
+        tokenizer=tokenizer,
+        train_baskets=train_b,
+        val_baskets=val_b,
+        epochs=epochs,
+        batch_size=32,
+        lr=2e-3,
+        seed=42,
+    )
+
+    initial_loss = history[0]["train_loss"]
+    final_loss = history[-1]["train_loss"]
+
+    # Save model checkpoint
+    checkpoint_path = Path("data/forecaster_lm.pt")
+    save_model_checkpoint(model, checkpoint_path)
+
+    return {
+        "status": "completed",
+        "epochs": epochs,
+        "initial_loss": initial_loss,
+        "final_loss": final_loss,
+        "loss_reduced": final_loss < initial_loss,
+        "history": history,
+        "checkpoint_saved": checkpoint_path.exists(),
+        "model_parameters": sum(p.numel() for p in model.parameters()),
+    }
+
+
+# ============================================================================
+# Stubs for Milestones 3-5 (Implemented in subsequent steps)
+# ============================================================================
 
 def milestone_3():  # TODO(milestone 3)
     raise NotImplementedError("TODO(milestone 3)")

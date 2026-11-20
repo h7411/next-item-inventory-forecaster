@@ -62,9 +62,43 @@ def test_milestone_1():
 
 
 # Milestone 2: Continue pretrain a small language model on these SKU sequences.
-@pytest.mark.skip(reason="remove this line when you start milestone 2")
-def test_milestone_2():
-    raise NotImplementedError("write the test for milestone 2")
+def test_milestone_2(tmp_path):
+    import torch
+    from app.core import (
+        SmallCausalSKUModel,
+        Tokenizer,
+        DEFAULT_CATALOG,
+        load_model_checkpoint,
+        milestone_2,
+        save_model_checkpoint,
+    )
+
+    # Test model initialization and forward shape
+    tok = Tokenizer(DEFAULT_CATALOG)
+    model = SmallCausalSKUModel(vocab_size=tok.vocab_size, d_model=32, n_heads=2, n_layers=1, max_seq_len=16)
+    dummy_input = torch.tensor([[tok.bos_token_id, 5, 6, tok.pad_token_id]], dtype=torch.long)
+    logits = model(dummy_input)
+    assert logits.shape == (1, 4, tok.vocab_size)
+
+    # Test loss computation
+    dummy_target = torch.tensor([[5, 6, tok.eos_token_id, tok.pad_token_id]], dtype=torch.long)
+    loss = model.compute_loss(logits, dummy_target)
+    assert loss.item() > 0.0
+
+    # Test saving and loading weights
+    ckpt = tmp_path / "test_model.pt"
+    save_model_checkpoint(model, ckpt)
+    assert ckpt.exists()
+    loaded_model = SmallCausalSKUModel(vocab_size=tok.vocab_size, d_model=32, n_heads=2, n_layers=1, max_seq_len=16)
+    load_model_checkpoint(loaded_model, ckpt)
+
+    # Test full milestone 2 pretraining execution (quick 3 epochs)
+    res = milestone_2(epochs=3)
+    assert res["status"] == "completed"
+    assert res["loss_reduced"] is True
+    assert res["final_loss"] < res["initial_loss"]
+    assert res["model_parameters"] > 0
+    assert len(res["history"]) == 3
 
 
 # Milestone 3: Implement next-item prediction logic using the trained model.
